@@ -1,14 +1,16 @@
 """
-KPS Server — pynput + tosu → HTML overlay
-Tracks keys with pynput, reads game state from tosu,
-broadcasts everything via WebSocket to the HTML overlay.
+KPS Server — tracks keys with pynput, reads game state from tosu (optional),
+broadcasts to HTML overlay via WebSocket.
+Works without osu/tosu running — just tracks keys standalone.
 """
 import asyncio
 import json
 import os
+import re
 import sys
 import time
 import threading
+import subprocess
 import configparser
 from collections import deque
 from pynput import keyboard as kb
@@ -20,7 +22,7 @@ except ImportError:
     input("Press Enter to exit...")
     sys.exit(1)
 
-# ── Locate files next to the .exe or script ──────────────
+# ── Locate config next to the .exe or script ─────────────
 def base_dir():
     if getattr(sys, 'frozen', False):
         return os.path.dirname(sys.executable)
@@ -35,18 +37,26 @@ DEFAULT_CONFIG = """\
 port = 24051
 tosu_host = localhost:24050
 
-[mania_keys]
-4k = d, f, j, k
-5k = d, f, space, j, k
-6k = s, d, f, j, k, l
-7k = s, d, f, space, j, k, l
-8k = a, s, d, f, j, k, l, ;
-9k = a, s, d, f, space, j, k, l, ;
+[keys]
+# mode = mania | o2jam | custom
+# For mania: key count switches automatically based on beatmap CS from tosu
+# For o2jam or custom: uses the 'default' row always (no auto-switch)
+mode = mania
+
+# mania key layouts (auto-switched by CS value from tosu)
+4k = q, w, p, [
+7k = q, w, e, space, p, [, ]
+
+# o2jam layout (7 keys: s d f space j k l)
+o2jam = s, d, f, space, j, k, l
+
+# custom: set mode=custom and put your keys here
+default = q, w, p, [
 
 [timing]
 window_ms = 1000
 broadcast_ms = 40
-only_in_play = true
+only_in_play = false
 
 [opacity]
 min_opacity = 0.08
@@ -60,12 +70,11 @@ if not os.path.exists(CONFIG_PATH):
     print(f"[INFO] Created config.ini at {CONFIG_PATH}")
 
 cfg.read_dict({
-    'server':     {'port': '24051', 'tosu_host': 'localhost:24050'},
-    'mania_keys': {'4k':'d,f,j,k','5k':'d,f,space,j,k','6k':'s,d,f,j,k,l',
-                   '7k':'s,d,f,space,j,k,l','8k':'a,s,d,f,j,k,l,;',
-                   '9k':'a,s,d,f,space,j,k,l,;'},
-    'timing':     {'window_ms':'1000','broadcast_ms':'40','only_in_play':'true'},
-    'opacity':    {'min_opacity':'0.08','max_opacity':'1.0'},
+    'server':  {'port': '24051', 'tosu_host': 'localhost:24050'},
+    'keys':    {'mode': 'mania', '4k': 'q,w,p,[', '7k': 'q,w,e,space,p,[,]',
+                'o2jam': 's,d,f,space,j,k,l', 'default': 'q,w,p,['},
+    'timing':  {'window_ms': '1000', 'broadcast_ms': '40', 'only_in_play': 'false'},
+    'opacity': {'min_opacity': '0.08', 'max_opacity': '1.0'},
 })
 cfg.read(CONFIG_PATH)
 
@@ -76,21 +85,33 @@ BROADCAST_MS = int(cfg['timing']['broadcast_ms'])
 ONLY_IN_PLAY = cfg['timing']['only_in_play'].strip().lower() == 'true'
 MIN_OPACITY  = float(cfg['opacity']['min_opacity'])
 MAX_OPACITY  = float(cfg['opacity']['max_opacity'])
+KEY_MODE     = cfg['keys']['mode'].strip().lower()   # 'mania' | 'o2jam' | 'custom'
 
 def parse_keys(s):
     return [k.strip().lower() for k in s.split(',') if k.strip()]
 
+# Build mania key map (4k, 7k, etc.)
 MANIA_KEYS = {}
-for k, v in cfg['mania_keys'].items():
-    try:
-        count = int(k.replace('k', ''))
-        MANIA_KEYS[count] = parse_keys(v)
-    except Exception:
-        pass
+for _k, _v in cfg['keys'].items():
+    if _k.endswith('k') and _k[:-1].isdigit():
+        MANIA_KEYS[int(_k[:-1])] = parse_keys(_v)
+
+# Fixed key layouts for non-mania modes
+O2JAM_KEYS  = parse_keys(cfg['keys']['o2jam'])
+DEFAULT_KEYS = parse_keys(cfg['keys']['default'])
+
+print(f"[CONFIG] mode={KEY_MODE}")
+if KEY_MODE == 'mania':
+    for kc, keys in sorted(MANIA_KEYS.items()):
+        print(f"[CONFIG]   {kc}K = {keys}")
+elif KEY_MODE == 'o2jam':
+    print(f"[CONFIG]   o2jam = {O2JAM_KEYS}")
+else:
+    print(f"[CONFIG]   default = {DEFAULT_KEYS}")
 
 # ── Shared game state ─────────────────────────────────────
 state = {
-    'game_state': 'Menu',
+    'game_state': 'menu',
     'in_play':    False,
     'mode':       'Mania',
     'key_count':  4,
@@ -99,32 +120,58 @@ state = {
 }
 state_lock = threading.Lock()
 
-# ── Active key config ─────────────────────────────────────
-active_keys     = parse_keys(cfg['mania_keys'].get('4k', 'd,f,j,k'))
-active_keys_set = set(active_keys)
+# ── Active keys (what we listen for) ─────────────────────
+if KEY_MODE == 'o2jam':
+    _start_keys = O2JAM_KEYS
+elif KEY_MODE == 'mania':
+    _start_keys = MANIA_KEYS.get(4, DEFAULT_KEYS)
+else:
+    _start_keys = DEFAULT_KEYS
+
+active_keys     = list(_start_keys)
+active_keys_set = set(_start_keys)
 keys_lock       = threading.Lock()
 
-def update_active_keys(key_count):
+def set_active_keys(keys):
     global active_keys, active_keys_set
-    keys = MANIA_KEYS.get(key_count) or MANIA_KEYS.get(4, ['d','f','j','k'])
     with keys_lock:
-        active_keys     = keys
+        active_keys     = list(keys)
         active_keys_set = set(keys)
-    print(f"[KEYS] {key_count}K -> {keys}")
+
+def update_active_keys_for_cs(cs_value):
+    """Only used in mania mode — pick closest key count to cs_value."""
+    if KEY_MODE != 'mania':
+        return
+    cs = round(float(cs_value))
+    available = list(MANIA_KEYS.keys())
+    if not available:
+        return
+    key_count = min(available, key=lambda k: abs(k - cs))
+    with state_lock:
+        old = state['key_count']
+    if key_count != old:
+        with state_lock:
+            state['key_count'] = key_count
+        keys = MANIA_KEYS[key_count]
+        set_active_keys(keys)
+        print(f"[KEYS] Switched to {key_count}K -> {keys}")
 
 # ── pynput key → string id ────────────────────────────────
 SPECIAL_MAP = {
     kb.Key.space:     'space',
-    kb.Key.shift:     'shift', kb.Key.shift_r: 'shift',
-    kb.Key.ctrl_l:    'ctrl',  kb.Key.ctrl_r:  'ctrl',
-    kb.Key.alt_l:     'alt',   kb.Key.alt_r:   'alt',
+    kb.Key.shift:     'shift',   kb.Key.shift_r:   'shift',
+    kb.Key.ctrl_l:    'ctrl',    kb.Key.ctrl_r:    'ctrl',
+    kb.Key.alt_l:     'alt',     kb.Key.alt_r:     'alt',
     kb.Key.enter:     'enter',
     kb.Key.backspace: 'bksp',
     kb.Key.tab:       'tab',
-    kb.Key.up:        'up',    kb.Key.down:  'down',
-    kb.Key.left:      'left',  kb.Key.right: 'right',
+    kb.Key.up:        'up',      kb.Key.down:      'down',
+    kb.Key.left:      'left',    kb.Key.right:     'right',
 }
-CHAR_MAP = {';':';',"'":"'",',':',','.':'.','/':'/','[':'[',']':']','`':'`','-':'-','=':'='}
+CHAR_MAP = {
+    ';': ';', "'": "'", ',': ',', '.': '.', '/': '/',
+    '[': '[', ']': ']', '`': '`', '-': '-', '=': '=',
+}
 
 def key_to_id(key):
     if key in SPECIAL_MAP:
@@ -137,7 +184,7 @@ def key_to_id(key):
         pass
     return None
 
-# ── Key tracking state ────────────────────────────────────
+# ── Key tracking ──────────────────────────────────────────
 press_log   = deque()
 held_since  = {}
 pressed_now = set()
@@ -166,56 +213,86 @@ def on_release(key):
             held_since.pop(k, None)
             pressed_now.discard(k)
 
-pynput_listener = kb.Listener(on_press=on_press, on_release=on_release)
-pynput_listener.daemon = True
-pynput_listener.start()
+listener = kb.Listener(on_press=on_press, on_release=on_release)
+listener.daemon = True
+listener.start()
 print("[PYNPUT] Keyboard listener started")
 
-# ── tosu WebSocket client ─────────────────────────────────
+# ── tosu client (optional — works without it) ─────────────
+_last_tosu_sig = None
+
+def _parse_tosu(data):
+    global _last_tosu_sig, active_keys, active_keys_set
+    with state_lock:
+        raw_state = data.get('state', {}).get('name', 'menu')
+        state['game_state'] = raw_state
+        state['in_play']    = raw_state.lower() == 'play'
+
+        mode_raw = (
+            data.get('play',     {}).get('mode', {}).get('name') or
+            data.get('beatmap',  {}).get('mode', {}).get('name') or
+            data.get('settings', {}).get('mode', {}).get('name') or
+            'Osu'
+        )
+        mode_name = mode_raw.strip().capitalize()
+        state['mode'] = mode_name
+
+        beatmap = data.get('beatmap', {})
+        cs_raw  = (
+            beatmap.get('stats', {}).get('cs', {}).get('original') or
+            beatmap.get('stats', {}).get('cs', {}).get('converted') or
+            4
+        )
+
+        bpm = (
+            beatmap.get('stats', {}).get('bpm', {}).get('common') or
+            beatmap.get('stats', {}).get('bpm', {}).get('realtime') or
+            0
+        )
+        state['bpm'] = round(float(bpm), 1)
+
+        artist = beatmap.get('artist') or beatmap.get('metadata', {}).get('artist', '')
+        title  = beatmap.get('title')  or beatmap.get('metadata', {}).get('title', '')
+        state['beatmap'] = f"{artist} - {title}".strip(' -')
+
+    # Key switching (only in mania mode)
+    update_active_keys_for_cs(cs_raw)
+
+    # Only log on meaningful changes
+    with state_lock:
+        kc = state['key_count']
+    sig = (raw_state, mode_name, kc)
+    if sig != _last_tosu_sig:
+        _last_tosu_sig = sig
+        print(f"[TOSU] state={raw_state}  mode={mode_name}  {kc}K")
+
 async def tosu_client():
     uri = f"ws://{TOSU_HOST}/websocket/v2"
+    was_connected = False
     while True:
         try:
             async with websockets.connect(uri, ping_interval=None) as ws:
-                print(f"[TOSU] Connected to {uri}")
+                if not was_connected:
+                    print(f"[TOSU] Connected -> {uri}")
+                was_connected = True
                 async for msg in ws:
                     try:
                         _parse_tosu(json.loads(msg))
-                    except Exception:
-                        pass
-        except Exception as e:
-            print(f"[TOSU] Disconnected ({e}), retrying in 2s...")
+                    except Exception as e:
+                        print(f"[TOSU] Parse error: {e}")
+        except Exception:
+            if was_connected:
+                print("[TOSU] Disconnected — running standalone, retrying quietly...")
+            was_connected = False
             await asyncio.sleep(2)
 
-def _parse_tosu(data):
-    with state_lock:
-        state['game_state'] = data.get('state', {}).get('name', 'Menu')
-        state['in_play']    = state['game_state'] == 'Play'
-
-        mode_name = (data.get('play', {}).get('mode', {}).get('name')
-                     or data.get('settings', {}).get('mode', {}).get('name', 'Osu'))
-        state['mode'] = mode_name
-
-        beatmap   = data.get('beatmap', {})
-        cs_raw    = beatmap.get('stats', {}).get('cs', {}).get('original', 4)
-        key_count = max(1, round(float(cs_raw))) if mode_name == 'Mania' else 4
-
-        if key_count != state['key_count']:
-            state['key_count'] = key_count
-            update_active_keys(key_count)
-
-        bpm = beatmap.get('stats', {}).get('bpm', {}).get('common', 0)
-        state['bpm'] = round(float(bpm), 1)
-
-        artist = beatmap.get('artist', '')
-        title  = beatmap.get('title', '')
-        state['beatmap'] = f"{artist} - {title}".strip(' -')
-
-# ── KPS calculation ───────────────────────────────────────
+# ── KPS + payload ─────────────────────────────────────────
 def calc_kps():
     now = time.time()
     with track_lock:
-        stale = [k for k, t in held_since.items() if now - t > 2.0]
+        # Remove truly ghost keys (no release event for 10s) from held_since only
+        # pressed_now is only cleared by on_release to avoid the hold-cancel bug
+        stale = [k for k, t in held_since.items() if now - t > 10.0]
         for k in stale:
             del held_since[k]
             pressed_now.discard(k)
@@ -239,11 +316,16 @@ def build_payload():
         pressing = set(pressed_now)
         counts   = dict(press_count)
 
+    # In o2jam/custom mode, report key_count from active keys length
+    kc = len(keys_list) if KEY_MODE != 'mania' else s['key_count']
+    mode_label = 'O2Jam' if KEY_MODE == 'o2jam' else s['mode']
+
     key_data = []
     for i, kid in enumerate(keys_list):
+        lbl = kid.upper() if len(kid) == 1 else kid[:3].upper()
         key_data.append({
             'id':        kid,
-            'label':     kid.upper() if len(kid) == 1 else kid.upper()[:3],
+            'label':     lbl,
             'col':       i + 1,
             'isPressed': kid in pressing,
             'count':     counts.get(kid, 0),
@@ -254,29 +336,30 @@ def build_payload():
         'opacity':   round(get_opacity(kps), 3),
         'inPlay':    s['in_play'],
         'gameState': s['game_state'],
-        'mode':      s['mode'],
-        'keyCount':  s['key_count'],
+        'mode':      mode_label,
+        'keyCount':  kc,
         'beatmap':   s['beatmap'],
         'bpm':       s['bpm'],
         'keys':      key_data,
     }
 
-# ── WebSocket server → HTML clients ──────────────────────
+# ── WebSocket server ──────────────────────────────────────
 clients      = set()
 clients_lock = asyncio.Lock()
 
 async def handler(websocket):
     async with clients_lock:
         clients.add(websocket)
-    print(f"[SERVER] Client connected: {websocket.remote_address}")
+    print(f"[SERVER] HTML client connected")
     try:
         await websocket.wait_closed()
     finally:
         async with clients_lock:
             clients.discard(websocket)
-        print(f"[SERVER] Client disconnected")
+        print(f"[SERVER] HTML client disconnected")
 
 async def broadcaster():
+    global clients
     interval = BROADCAST_MS / 1000
     while True:
         await asyncio.sleep(interval)
@@ -292,16 +375,47 @@ async def broadcaster():
                     dead.add(ws)
             clients -= dead
 
-# ── Main ──────────────────────────────────────────────────
+# ── Port helper ───────────────────────────────────────────
+def free_port(port):
+    try:
+        out = subprocess.check_output(
+            f'netstat -ano | findstr ":{port} "',
+            shell=True, stderr=subprocess.DEVNULL, text=True
+        )
+        pids = set(re.findall(r'(\d+)\s*$', out, re.MULTILINE))
+        pids.discard('0')
+        for pid in pids:
+            subprocess.call(f'taskkill /F /PID {pid}',
+                            shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            print(f"[SERVER] Freed port {port} (killed PID {pid})")
+        return bool(pids)
+    except Exception as e:
+        print(f"[SERVER] Could not free port {port}: {e}")
+        return False
+
+# ── Main ─────────────────────────────────────────────────
 async def main():
-    print(f"[SERVER] KPS server starting on ws://localhost:{PORT}")
-    print(f"[SERVER] Overlay URL: http://localhost:24050/kps-overlay/")
+    print(f"[SERVER] ws://127.0.0.1:{PORT}  |  overlay: http://localhost:24050/kps-overlay/")
     print(f"[SERVER] Press Ctrl+C to stop.")
 
-    server    = await websockets.serve(handler, 'localhost', PORT)
+    try:
+        server = await websockets.serve(handler, '127.0.0.1', PORT)
+    except OSError as e:
+        if e.errno == 10048 or '10048' in str(e):
+            print(f"[SERVER] Port {PORT} busy — freeing...")
+            free_port(PORT)
+            await asyncio.sleep(0.5)
+            try:
+                server = await websockets.serve(handler, '127.0.0.1', PORT)
+            except OSError:
+                print(f"[ERROR] Port {PORT} still busy. Close old process and retry.")
+                input("Press Enter to exit...")
+                return
+        else:
+            raise
+
     tosu_task = asyncio.create_task(tosu_client())
     bcast     = asyncio.create_task(broadcaster())
-
     try:
         await asyncio.gather(server.serve_forever(), tosu_task, bcast)
     except (KeyboardInterrupt, SystemExit):

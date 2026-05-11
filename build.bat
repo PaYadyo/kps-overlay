@@ -4,7 +4,7 @@ pip install pynput websockets pyinstaller
 
 echo.
 echo Building kps_server.exe...
-pyinstaller --onefile --noconsole --name "kps_server" kps_server.py
+pyinstaller --onefile --console --hidden-import=pynput.keyboard._win32 --hidden-import=pynput.mouse._win32 --hidden-import=pynput.keyboard._base --name "kps_server" kps_server.py
 
 echo.
 echo Copying config.ini to dist\...
