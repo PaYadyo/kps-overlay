@@ -1,0 +1,16 @@
+# Claude context - never commit
+CLAUDE.md
+
+# PyInstaller artifacts
+build/
+dist/
+*.spec
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# OS
+.DS_Store
+Thumbs.db
