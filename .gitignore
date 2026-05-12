@@ -1,6 +1,9 @@
 # Claude context - never commit
 CLAUDE.md
 
+# User config - personal key bindings
+config.ini
+
 # PyInstaller artifacts
 build/
 dist/
