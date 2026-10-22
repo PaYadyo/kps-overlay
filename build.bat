@@ -1,24 +1,38 @@
 @echo off
-echo Installing dependencies...
-pip install pynput websockets pyinstaller
+setlocal
+cd /d "%~dp0"
 
+echo ===================================================
+echo             KPS Overlay Build Suite
+echo ===================================================
 echo.
-echo Building kps_server.exe...
-pyinstaller --onefile --console --hidden-import=pynput.keyboard._win32 --hidden-import=pynput.mouse._win32 --hidden-import=pynput.keyboard._base --name "kps_server" kps_server.py
+echo  [1] Build Server (kps_server.exe for OBS)
+echo  [2] Build Overlay (kps_overlay.exe for Desktop)
+echo  [3] Build Both (Server + Desktop Overlay)
+echo.
 
-echo.
-echo Copying config.ini to dist\...
-copy /Y config.ini dist\config.ini
+set /p choice="Enter choice [1/2/3]: "
 
-echo.
-echo =============================================
-echo  DONE! Files are in the dist\ folder.
-echo =============================================
-echo.
-echo HOW TO USE:
-echo   1. Run tosu.exe first
-echo   2. Run dist\kps_server.exe
-echo   3. OBS Browser Source: http://localhost:24050/kps-overlay/
-echo      Size: 160 x 200 px
-echo.
+if "%choice%"=="1" goto build_server
+if "%choice%"=="2" goto build_overlay
+if "%choice%"=="3" goto build_both
+echo Invalid choice.
 pause
+exit /b 1
+
+:build_server
+call build_server.bat
+exit /b
+
+:build_overlay
+call build_overlay.bat
+exit /b
+
+:build_both
+echo.
+echo === [Step 1/2] Building kps_server.exe ===
+call build_server.bat
+echo.
+echo === [Step 2/2] Building kps_overlay.exe ===
+call build_overlay.bat
+exit /b

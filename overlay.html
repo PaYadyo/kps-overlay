@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>KPS Overlay for OBS</title>
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      user-select: none;
+    }
+
+    body {
+      background: transparent;
+      overflow: hidden;
+      font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, Roboto, sans-serif;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      color: #ffffff;
+    }
+
+    #container {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      transition: opacity 0.12s ease-out;
+      opacity: 0.1;
+      padding: 10px;
+    }
+
+    /* KPS Circle Meter */
+    .meter-box {
+      position: relative;
+      width: 120px;
+      height: 120px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin-bottom: 12px;
+    }
+
+    .circle-bg {
+      position: absolute;
+      inset: 0;
+      border-radius: 50%;
+      background: #1a1a1a;
+      transition: background 0.15s ease-out, box-shadow 0.15s ease-out;
+    }
+
+    .circle-ring {
+      position: absolute;
+      inset: -3px;
+      border-radius: 50%;
+      border: 2px solid #333333;
+      transition: border-color 0.15s ease-out, box-shadow 0.15s ease-out;
+    }
+
+    .meter-content {
+      position: relative;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      z-index: 2;
+    }
+
+    .kps-num {
+      font-size: 40px;
+      font-weight: 700;
+      line-height: 1;
+      color: #ffffff;
+      font-feature-settings: "tnum";
+      font-variant-numeric: tabular-nums;
+      transition: color 0.15s ease-out;
+      text-shadow: 0 0 12px rgba(255, 255, 255, 0.2);
+    }
+
+    .kps-label {
+      font-size: 9px;
+      font-weight: 600;
+      letter-spacing: 1px;
+      color: #777777;
+      margin-top: 4px;
+      transition: color 0.15s ease-out;
+    }
+
+    /* Keys Row */
+    .keys-row {
+      display: flex;
+      gap: 4px;
+      justify-content: center;
+      align-items: center;
+      flex-wrap: nowrap;
+    }
+
+    .key-cap {
+      min-width: 28px;
+      height: 24px;
+      padding: 0 6px;
+      background: #1e1e1e;
+      border: 1px solid #444444;
+      border-radius: 4px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 9px;
+      font-weight: 700;
+      color: #777777;
+      transition: all 0.06s cubic-bezier(0.2, 0.8, 0.2, 1);
+    }
+
+    .key-cap.pressed {
+      transform: translateY(2px) scale(0.97);
+      box-shadow: 0 0 8px currentColor;
+    }
+
+    /* Disconnected status pill */
+    #status {
+      position: fixed;
+      top: 6px;
+      left: 6px;
+      font-size: 8px;
+      padding: 2px 6px;
+      border-radius: 99px;
+      background: rgba(255, 50, 50, 0.2);
+      color: #ff6666;
+      border: 1px solid rgba(255, 50, 50, 0.3);
+      display: none;
+    }
+  </style>
+</head>
+<body>
+  <div id="status">Connecting...</div>
+
+  <div id="container">
+    <div class="meter-box">
+      <div id="circleBg" class="circle-bg"></div>
+      <div id="circleRing" class="circle-ring"></div>
+      <div class="meter-content">
+        <div id="kpsNum" class="kps-num">0</div>
+        <div id="kpsLabel" class="kps-label">KPS</div>
+      </div>
+    </div>
+
+    <div id="keysRow" class="keys-row"></div>
+  </div>
+
+  <script>
+    const params = new URLSearchParams(window.location.search);
+    const wsPort = params.get('port') || '24051';
+    const wsHost = window.location.hostname || 'localhost';
+    const wsUrl = `ws://${wsHost}:${wsPort}`;
+
+    const container = document.getElementById('container');
+    const statusEl = document.getElementById('status');
+    const kpsNum = document.getElementById('kpsNum');
+    const kpsLabel = document.getElementById('kpsLabel');
+    const circleBg = document.getElementById('circleBg');
+    const circleRing = document.getElementById('circleRing');
+    const keysRow = document.getElementById('keysRow');
+
+    function lerp(a, b, t) {
+      return a + (b - a) * t;
+    }
+
+    // Color ramp matching kps_overlay exactly
+    function getColor(kps) {
+      if (kps <= 0)  return [160, 160, 255];
+      if (kps <= 8) {
+        const t = kps / 8;
+        return [Math.round(lerp(160, 80, t)), Math.round(lerp(160, 200, t)), 255];
+      }
+      if (kps <= 16) {
+        const t = (kps - 8) / 8;
+        return [Math.round(lerp(80, 0, t)), Math.round(lerp(200, 255, t)), 255];
+      }
+      if (kps <= 24) {
+        const t = (kps - 16) / 8;
+        return [Math.round(lerp(0, 80, t)), 255, Math.round(lerp(255, 60, t))];
+      }
+      if (kps <= 32) {
+        const t = (kps - 24) / 8;
+        return [Math.round(lerp(80, 255, t)), 255, Math.round(lerp(60, 0, t))];
+      }
+      if (kps <= 40) {
+        const t = (kps - 32) / 8;
+        return [255, Math.round(lerp(255, 40, t)), 0];
+      }
+      if (kps <= 48) {
+        const t = (kps - 40) / 8;
+        return [Math.round(lerp(255, 160, t)), Math.round(lerp(40, 0, t)), Math.round(lerp(0, 230, t))];
+      }
+      if (kps <= 56) {
+        const t = (kps - 48) / 8;
+        return [Math.round(lerp(160, 50, t)), 0, Math.round(lerp(230, 120, t))];
+      }
+      return [20, 0, 50];
+    }
+
+    let renderedKeyIds = '';
+
+    function renderKeys(keys, mainColor, ringColor) {
+      const keySignature = keys.map(k => k.id).join(',');
+      if (keySignature !== renderedKeyIds) {
+        keysRow.innerHTML = '';
+        keys.forEach(k => {
+          const cap = document.createElement('div');
+          cap.id = `key-${k.id}`;
+          cap.className = 'key-cap';
+          cap.textContent = k.label;
+          keysRow.appendChild(cap);
+        });
+        renderedKeyIds = keySignature;
+      }
+
+      keys.forEach(k => {
+        const el = document.getElementById(`key-${k.id}`);
+        if (!el) return;
+        if (k.isPressed) {
+          el.classList.add('pressed');
+          el.style.backgroundColor = `rgba(${mainColor[0]}, ${mainColor[1]}, ${mainColor[2]}, 0.35)`;
+          el.style.borderColor = ringColor;
+          el.style.color = `rgb(${mainColor[0]}, ${mainColor[1]}, ${mainColor[2]})`;
+          el.style.boxShadow = `0 0 10px rgba(${mainColor[0]}, ${mainColor[1]}, ${mainColor[2]}, 0.5)`;
+        } else {
+          el.classList.remove('pressed');
+          el.style.backgroundColor = '#1e1e1e';
+          el.style.borderColor = '#444444';
+          el.style.color = '#777777';
+          el.style.boxShadow = 'none';
+        }
+      });
+    }
+
+    function updateOverlay(data) {
+      const kps = data.kps || 0;
+      const opacity = data.opacity ?? 0.1;
+      const color = getColor(kps);
+      const cStr = `rgb(${color[0]}, ${color[1]}, ${color[2]})`;
+      const ringStr = kps > 5 ? `rgba(${color[0]}, ${color[1]}, ${color[2]}, 0.6)` : '#333333';
+      const bgStr = kps > 5 ? `rgba(${color[0]}, ${color[1]}, ${color[2]}, 0.12)` : '#1a1a1a';
+      const glowStr = kps > 8 ? `0 0 18px rgba(${color[0]}, ${color[1]}, ${color[2]}, 0.4)` : 'none';
+
+      container.style.opacity = opacity;
+      kpsNum.textContent = kps;
+      kpsNum.style.color = cStr;
+      kpsNum.style.textShadow = kps > 0 ? `0 0 14px rgba(${color[0]}, ${color[1]}, ${color[2]}, 0.5)` : 'none';
+      kpsLabel.style.color = `rgba(${color[0]}, ${color[1]}, ${color[2]}, 0.7)`;
+
+      circleBg.style.background = bgStr;
+      circleBg.style.boxShadow = glowStr;
+      circleRing.style.borderColor = ringStr;
+
+      if (Array.isArray(data.keys)) {
+        renderKeys(data.keys, color, ringStr);
+      }
+    }
+
+    function connect() {
+      statusEl.style.display = 'block';
+      statusEl.textContent = 'Connecting...';
+
+      const ws = new WebSocket(wsUrl);
+
+      ws.onopen = () => {
+        statusEl.style.display = 'none';
+      };
+
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          updateOverlay(data);
+        } catch (e) {
+          console.error(e);
+        }
+      };
+
+      ws.onclose = () => {
+        statusEl.style.display = 'block';
+        statusEl.textContent = 'Disconnected';
+        container.style.opacity = '0.08';
+        setTimeout(connect, 1500);
+      };
+
+      ws.onerror = () => {
+        ws.close();
+      };
+    }
+
+    connect();
+  </script>
+</body>
+</html>

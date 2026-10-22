@@ -1,8 +1,6 @@
-# Claude context - never commit
-CLAUDE.md
-
 # User config - personal key bindings
 config.ini
+kps_overlay.ini
 
 # PyInstaller artifacts
 build/
@@ -14,6 +12,8 @@ __pycache__/
 *.pyc
 *.pyo
 
-# OS
+# OS & Editor
 .DS_Store
 Thumbs.db
+.vscode/
+.idea/
